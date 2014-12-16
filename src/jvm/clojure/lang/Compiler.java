@@ -220,6 +220,9 @@ static final public Var NO_RECUR = Var.create(null).setDynamic();
 //DynamicClassLoader
 static final public Var LOADER = Var.create().setDynamic();
 
+//Map form->class or null
+static final public Var MAYBE_CLASSES = Var.create().setDynamic();
+
 //String
 static final public Var SOURCE = Var.intern(Namespace.findOrCreate(Symbol.intern("clojure.core")),
                                             Symbol.intern("*source-path*"), "NO_SOURCE_FILE").setDynamic();
@@ -396,6 +399,7 @@ static class DefExpr implements Expr{
 	public final int line;
 	public final int column;
 	final static Method bindRootMethod = Method.getMethod("void bindRoot(Object)");
+	final static Method initLazyRootMethod = Method.getMethod("void initLazyRoot(clojure.lang.FnLoaderThunk)");
 	final static Method setTagMethod = Method.getMethod("void setTag(clojure.lang.Symbol)");
 	final static Method setMetaMethod = Method.getMethod("void setMeta(clojure.lang.IPersistentMap)");
 	final static Method setDynamicMethod = Method.getMethod("clojure.lang.Var setDynamic(boolean)");
@@ -430,9 +434,12 @@ static class DefExpr implements Expr{
 			{
 			if(initProvided)
 				{
-//			if(init instanceof FnExpr && ((FnExpr) init).closes.count()==0)
-//				var.bindRoot(new FnLoaderThunk((FnExpr) init,var));
-//			else
+			if(init instanceof FnExpr
+			   && !((FnExpr) init).hasEnclosingMethod
+//			   && !((FnExpr) init).hasPrimSigs
+			   && ((FnExpr) init).closes.count()==0)
+				var.initLazyRoot(new FnLoaderThunk((ObjExpr) init));
+			else
 				var.bindRoot(init.eval());
 				}
 			if(meta != null)
@@ -454,6 +461,10 @@ static class DefExpr implements Expr{
 
 	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){
 		objx.emitVar(gen, var);
+//		gen.push(var.ns.name.toString());
+//		gen.push(var.sym.toString());
+//		gen.invokeStatic(RT_TYPE, Method.getMethod("clojure.lang.Var var(String,String)"));
+
 		if(isDynamic)
 			{
 			gen.push(isDynamic);
@@ -474,11 +485,19 @@ static class DefExpr implements Expr{
 			gen.dup();
 			if(init instanceof FnExpr)
 				{
-				((FnExpr)init).emitForDefn(objx, gen);
+				if(((FnExpr)init).emitForDefn(objx, gen))
+					{
+//					System.out.println("emit lazy thunk for defn var: " + var);
+					gen.invokeVirtual(VAR_TYPE, initLazyRootMethod);
+					}
+				else
+					gen.invokeVirtual(VAR_TYPE, bindRootMethod);
 				}
 			else
+				{
 				init.emit(C.EXPRESSION, objx, gen);
-			gen.invokeVirtual(VAR_TYPE, bindRootMethod);
+				gen.invokeVirtual(VAR_TYPE, bindRootMethod);
+				}
 			}
 
 		if(context == C.STATEMENT)
@@ -509,6 +528,7 @@ static class DefExpr implements Expr{
 					throw Util.runtimeException("First argument to def must be a Symbol");
 			Symbol sym = (Symbol) RT.second(form);
 			Var v = lookupVar(sym, true);
+			//Var v = lookupVar(sym, true, true, false);
 			if(v == null)
 				throw Util.runtimeException("Can't refer to qualified var that doesn't exist");
 			if(!v.ns.equals(currentNS()))
@@ -985,9 +1005,20 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 		}
 	}
 
-	private static Class maybeClass(Object form, boolean stringOk) {
+	public static Class maybeClass(Object form, boolean stringOk) {
 		if(form instanceof Class)
 			return (Class) form;
+		HashMap m = MAYBE_CLASSES.isBound()?(HashMap) MAYBE_CLASSES.get():null;
+//		if(m != null){
+//			if(m.containsKey(form))
+//				return (Class) m.get(form);
+//			else
+//				System.out.println("MAYBE_CLASSES can't find: " + form);
+//			}
+//		else
+//			throw new RuntimeException("MAYBE_CLASSES unbound: " + form);
+//			System.out.println("MAYBE_CLASSES unbound");
+
 		Class c = null;
 		if(form instanceof Symbol)
 			{
@@ -997,20 +1028,27 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 				if(Util.equals(sym,COMPILE_STUB_SYM.get()))
 					return (Class) COMPILE_STUB_CLASS.get();
 				if(sym.name.indexOf('.') > 0 || sym.name.charAt(0) == '[')
+					{
+					if(m != null && m.containsKey(form))
+						return (Class) m.get(form);
 					c = RT.classForName(sym.name);
+//					System.out.println("maybeClass: " + form + ", " + c);
+					}
 				else
 					{
 					Object o = currentNS().getMapping(sym);
 					if(o instanceof Class)
-						c = (Class) o;
-					else if(LOCAL_ENV.deref() != null && ((java.util.Map)LOCAL_ENV.deref()).containsKey(form))
-						return null;
+						return (Class) o;
 					else
 						{
+						if(m != null && m.containsKey(form))
+							return (Class) m.get(form);
 						try{
 						c = RT.classForName(sym.name);
+//						System.out.println("maybeClass: " + form + ", " + c);
 						}
 						catch(Exception e){
+//							System.out.println("maybeClass: " + form + ", MISS, " + form.getClass() + "," + form.hashCode() + ", " + m.size());
 							// aargh
 							// leave c set to null -> return null
 						}
@@ -1018,8 +1056,18 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 					}
 				}
 			}
-		else if(stringOk && form instanceof String)
+		else if(stringOk && form instanceof String){
+			if(m != null && m.containsKey(form))
+				return (Class) m.get(form);
 			c = RT.classForName((String) form);
+		}
+
+		if(m != null)
+			{
+			m.put(form,c);
+//			System.out.println("maybeClass ADDED: " + form + ", " + m.size());
+			}
+
 		return c;
 	}
 
@@ -3793,6 +3841,7 @@ static public class FnExpr extends ObjExpr{
 	IPersistentCollection methods;
 	private boolean hasPrimSigs;
 	private boolean hasMeta;
+	private boolean hasEnclosingMethod;
 	//	String superName = null;
 
 	public FnExpr(Object tag){
@@ -3838,6 +3887,7 @@ static public class FnExpr extends ObjExpr{
 		FnExpr fn = new FnExpr(tagOf(form));
 		fn.src = form;
 		ObjMethod enclosingMethod = (ObjMethod) METHOD.deref();
+		fn.hasEnclosingMethod = enclosingMethod != null;
 		if(((IMeta) form.first()).meta() != null)
 			{
 			fn.onceOnly = RT.booleanCast(RT.get(RT.meta(form.first()), Keyword.intern(null, "once")));
@@ -3966,7 +4016,7 @@ static public class FnExpr extends ObjExpr{
 			{
 			throw Util.sneakyThrow(e);
 			}
-		fn.getCompiledClass();
+		fn.getCompiledClass((DynamicClassLoader) LOADER.deref());
 
 		if(fn.supportsMeta())
 			{
@@ -3990,20 +4040,48 @@ static public class FnExpr extends ObjExpr{
 		return methods;
 	}
 
-	public void emitForDefn(ObjExpr objx, GeneratorAdapter gen){
-//		if(!hasPrimSigs && closes.count() == 0)
-//			{
-//			Type thunkType = Type.getType(FnLoaderThunk.class);
-////			presumes var on stack
-//			gen.dup();
-//			gen.newInstance(thunkType);
+	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){
+		if(!hasEnclosingMethod && !hasPrimSigs && closes.count() == 0)
+			{
+			String iname = internalName.replace('/','.');
+//			System.out.println("emit lazy thunk for fn: " + name + ", iname: " + iname);
+			Type thunkType = Type.getType(FnLoaderThunk.class);
+//			gen.visitInsn(Opcodes.ACONST_NULL);
+			gen.newInstance(thunkType);
+			gen.dup();
 //			gen.dupX1();
 //			gen.swap();
-//			gen.push(internalName.replace('/','.'));
-//			gen.invokeConstructor(thunkType,Method.getMethod("void <init>(clojure.lang.Var,String)"));
-//			}
-//		else
-			emit(C.EXPRESSION,objx,gen);
+			gen.push(iname);
+			gen.invokeConstructor(thunkType,Method.getMethod("void <init>(String)"));
+			}
+		else
+			super.emit(context,objx,gen);
+	}
+
+	public boolean emitForDefn(ObjExpr objx, GeneratorAdapter gen){
+		if(!hasEnclosingMethod
+		   //&& !hasPrimSigs
+		   && closes.count() == 0)
+			{
+			String iname = internalName.replace('/','.');
+//			System.out.println("emit lazy thunk for defn: " + name + ", iname: " + iname);
+			Type thunkType = Type.getType(FnLoaderThunk.class);
+//			presumes var on stack
+//			gen.dup();
+			gen.newInstance(thunkType);
+			gen.dup();
+//			gen.dupX1();
+//			gen.swap();
+			gen.push(iname);
+			gen.invokeConstructor(thunkType,Method.getMethod("void <init>(String)"));
+			return true;
+			}
+		else
+			{
+//			System.out.println("Not emit lazy thunk for defn: " + name);
+			emit(C.EXPRESSION, objx, gen);
+			return false;
+			}
 	}
 }
 
@@ -4671,7 +4749,7 @@ static public class ObjExpr implements Expr{
 				}
 			emitListAsObjectArray(entries, gen);
 			gen.invokeStatic(RT_TYPE,
-							 Method.getMethod("clojure.lang.IPersistentMap map(Object[])"));
+							 Method.getMethod("clojure.lang.IPersistentMap mapUniqueKeys(Object[])"));
 			}
 		else if(value instanceof IPersistentVector)
 			{
@@ -4756,7 +4834,10 @@ static public class ObjExpr implements Expr{
 			for(int i = 0; i < constants.count(); i++)
 				{
 				emitValue(constants.nth(i), clinitgen);
-				clinitgen.checkCast(constantType(i));
+				if(!constantType(i).equals(Type.getType(Var.class)))
+					{
+					clinitgen.checkCast(constantType(i));
+					}
 				clinitgen.putStatic(objtype, constantName(i), constantType(i));
 				}
 			}
@@ -4799,13 +4880,13 @@ static public class ObjExpr implements Expr{
 //			}
 	}
 
-	synchronized Class getCompiledClass(){
+	synchronized Class getCompiledClass(DynamicClassLoader loader){
 		if(compiledClass == null)
 //			if(RT.booleanCast(COMPILE_FILES.deref()))
 //				compiledClass = RT.classForName(name);//loader.defineClass(name, bytecode);
 //			else
 				{
-				loader = (DynamicClassLoader) LOADER.deref();
+				//loader = (DynamicClassLoader) LOADER.deref();
 				compiledClass = loader.defineClass(name, bytecode, src);
 				}
 		return compiledClass;
@@ -4816,7 +4897,7 @@ static public class ObjExpr implements Expr{
 			return null;
 		try
 			{
-			return getCompiledClass().newInstance();
+			return getCompiledClass((DynamicClassLoader) LOADER.deref()).newInstance();
 			}
 		catch(Exception e)
 			{
@@ -5074,12 +5155,14 @@ static public class ObjExpr implements Expr{
 //				return Type.getType(KeywordCallSite.class);
 			else if(RestFn.class.isAssignableFrom(c))
 				return Type.getType(RestFn.class);
-			else if(AFn.class.isAssignableFrom(c))
+			else if(IPersistentMap.class.isAssignableFrom(c))
+					return Type.getType(IPersistentMap.class);
+			else if(AFn.class.isAssignableFrom(c) && !IPersistentCollection.class.isAssignableFrom(c))
 					return Type.getType(AFn.class);
-				else if(c == Var.class)
-						return Type.getType(Var.class);
-					else if(c == String.class)
-							return Type.getType(String.class);
+			else if(c == Var.class)
+				return Type.getType(Var.class);
+			else if(c == String.class)
+				return Type.getType(String.class);
 
 //			return Type.getType(c);
 			}
@@ -6728,14 +6811,24 @@ static String errorMsg(String source, int line, int column, String s){
 }
 
 public static Object eval(Object form) {
-	return eval(form, true);
+	Var.pushThreadBindings(RT.map(MAYBE_CLASSES, new HashMap()));
+
+	try{
+		return eval(form, true);
+	}
+	finally{
+		Var.popThreadBindings();
+	}
+
 }
 
 public static Object eval(Object form, boolean freshLoader) {
 	boolean createdLoader = false;
 	if(true)//!LOADER.isBound())
 		{
-		Var.pushThreadBindings(RT.map(LOADER, RT.makeClassLoader()));
+		Var.pushThreadBindings(RT.map(LOADER, RT.makeClassLoader()
+//		                              ,MAYBE_CLASSES, new HashMap()
+		));
 		createdLoader = true;
 		}
 	try
@@ -7039,7 +7132,7 @@ static public Object maybeResolveIn(Namespace n, Symbol sym) {
 }
 
 
-static Var lookupVar(Symbol sym, boolean internNew, boolean registerMacro) {
+static Var lookupVar(Symbol sym, boolean internNew, boolean registerMacro, boolean registerVar) {
 	Var var = null;
 
 	//note - ns-qualified vars in other namespaces must already exist
@@ -7078,10 +7171,15 @@ static Var lookupVar(Symbol sym, boolean internNew, boolean registerMacro) {
 				throw Util.runtimeException("Expecting var, but " + sym + " is mapped to " + o);
 				}
 			}
-	if(var != null && (!var.isMacro() || registerMacro))
+	if(registerVar && var != null && (!var.isMacro() || registerMacro))
 		registerVar(var);
 	return var;
 }
+
+static Var lookupVar(Symbol sym, boolean internNew, boolean registerMacro) {
+    return lookupVar(sym, internNew, registerMacro, true);
+}
+
 static Var lookupVar(Symbol sym, boolean internNew) {
     return lookupVar(sym, internNew, true);
 }
@@ -7174,6 +7272,8 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 			       LOCAL_ENV, null,
 					LOOP_LOCALS, null,
 					NEXT_LOCAL_NUM, 0,
+//					MAYBE_CLASSES, new HashMap(),
+					MAYBE_CLASSES, MAYBE_CLASSES.isBound()?MAYBE_CLASSES.get():new HashMap(),
 					RT.READEVAL, RT.T,
 			       RT.CURRENT_NS, RT.CURRENT_NS.deref(),
 			       LINE_BEFORE, pushbackReader.getLineNumber(),
@@ -7256,6 +7356,13 @@ public static void pushNSandLoader(ClassLoader loader){
 	                              ));
 }
 
+static long lastpr = System.nanoTime();
+public static void prtime(String s){
+//	long t = System.nanoTime();
+//	System.out.println(s + ": " + ((t-lastpr)/100000)/10.0);
+//	lastpr = t;
+}
+
 public static ILookupThunk getLookupThunk(Object target, Keyword k){
 	return null;  //To change body of created methods use File | Settings | File Templates.
 }
@@ -7323,6 +7430,7 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 			       CONSTANT_IDS, new IdentityHashMap(),
 			       KEYWORDS, PersistentHashMap.EMPTY,
 			       VARS, PersistentHashMap.EMPTY
+			       ,MAYBE_CLASSES, new HashMap()
 					,RT.UNCHECKED_MATH, RT.UNCHECKED_MATH.deref()
 					,RT.WARN_ON_REFLECTION, RT.WARN_ON_REFLECTION.deref()
 					,RT.DATA_READERS, RT.DATA_READERS.deref()
@@ -7348,6 +7456,8 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		                                            null,
 		                                            cv);
 		gen.visitCode();
+//		gen.push(objx.internalName.replace('/','.') + " load enter");
+//		gen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void prtime(String)"));
 
 		for(Object r = LispReader.read(pushbackReader, false, EOF, false); r != EOF;
 		    r = LispReader.read(pushbackReader, false, EOF, false))
@@ -7358,6 +7468,10 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 				LINE_BEFORE.set(pushbackReader.getLineNumber());
 				COLUMN_BEFORE.set(pushbackReader.getColumnNumber());
 			}
+
+//		gen.push(objx.internalName.replace('/','.') + " load exit");
+//		gen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void prtime(String)"));
+
 		//end of load
 		gen.returnValue();
 		gen.endMethod();
@@ -7370,6 +7484,7 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 			}
 
 		final int INITS_PER = 100;
+//		System.out.println("Compiling constants for " + objx.internalName + ": " + objx.constants.count());
 		int numInits =  objx.constants.count() / INITS_PER;
 		if(objx.constants.count() % INITS_PER != 0)
 			++numInits;
@@ -7388,8 +7503,18 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 
 				for(int i = n*INITS_PER; i < objx.constants.count() && i < (n+1)*INITS_PER; i++)
 					{
+//					System.out.println("constant: " + objx.constants.nth(i));
 					objx.emitValue(objx.constants.nth(i), clinitgen);
-					clinitgen.checkCast(objx.constantType(i));
+					if(objx.constantType(i).equals(Type.getType(Var.class)))
+						{
+//						System.out.println("omit checkcast: " + objx.constantName(i));
+						}
+					else
+						{
+//						System.out.println("checkcast: " + objx.constantType(i));
+						clinitgen.checkCast(objx.constantType(i));
+						}
+
 					clinitgen.putStatic(objx.objtype, objx.constantName(i), objx.constantType(i));
 					}
 				}
@@ -7417,15 +7542,28 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 //			{
 //			objx.emitConstants(clinitgen);
 //			}
+		clinitgen.push(objx.internalName.replace('/','.') + " enter");
+		clinitgen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void prtime(String)"));
 		for(int n = 0;n<numInits;n++)
 			clinitgen.invokeStatic(objx.objtype, Method.getMethod("void __init" + n + "()"));
+
+		clinitgen.push(objx.internalName.replace('/','.') + " init");
+		clinitgen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void prtime(String)"));
 
 		clinitgen.push(objx.internalName.replace('/','.'));
 		clinitgen.invokeStatic(CLASS_TYPE, Method.getMethod("Class forName(String)"));
 		clinitgen.invokeVirtual(CLASS_TYPE,Method.getMethod("ClassLoader getClassLoader()"));
 		clinitgen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void pushNSandLoader(ClassLoader)"));
 		clinitgen.mark(startTry);
+
+		clinitgen.push(objx.internalName.replace('/','.') + " class");
+		clinitgen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void prtime(String)"));
+
 		clinitgen.invokeStatic(objx.objtype, Method.getMethod("void load()"));
+
+		clinitgen.push(objx.internalName.replace('/','.') + " load");
+		clinitgen.invokeStatic(Type.getType(Compiler.class), Method.getMethod("void prtime(String)"));
+
 		clinitgen.mark(endTry);
 		clinitgen.invokeStatic(VAR_TYPE, Method.getMethod("void popThreadBindings()"));
 		clinitgen.goTo(end);
@@ -7635,7 +7773,7 @@ static public class NewInstanceExpr extends ObjExpr{
 			{
 			throw Util.sneakyThrow(e);
 			}
-		ret.getCompiledClass();
+		ret.getCompiledClass((DynamicClassLoader) LOADER.deref());
 		return ret;
 		}
 

@@ -14,6 +14,7 @@ package clojure.lang;
 
 import java.io.ObjectStreamException;
 import java.io.Serializable;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -23,6 +24,9 @@ transient final AtomicReference<IPersistentMap> mappings = new AtomicReference<I
 transient final AtomicReference<IPersistentMap> aliases = new AtomicReference<IPersistentMap>();
 
 final static ConcurrentHashMap<Symbol, Namespace> namespaces = new ConcurrentHashMap<Symbol, Namespace>();
+final static Object lock = new Object();
+static IPersistentMap lastCore = null;
+static IPersistentMap lastMerge = null;
 
 public String toString(){
 	return name.toString();
@@ -167,6 +171,50 @@ public Class importClass(Class c){
 public Var refer(Symbol sym, Var var){
 	return (Var) reference(sym, var);
 
+}
+
+public boolean initWith(Namespace ns){
+//	System.out.println("initWith: " + name + ", " + ns.name);
+
+	synchronized(lock){
+	IPersistentMap ms = ns.mappings.get();
+	IPersistentMap tm = mappings.get();
+	IPersistentMap dimp = RT.DEFAULT_IMPORTS;
+	if(lastCore != ms)
+		{
+//		System.out.println("initWith REMERGE: " + name + ", " + ns.name + ", " + ms.count() + ", " +
+//		                   (lastCore == null?0:lastCore.count()));
+
+		IPersistentMap merge = (lastMerge != null)?lastMerge:dimp;
+		for(Object o : ms)
+			{
+			Map.Entry e = (Map.Entry) o;
+			Symbol s = (Symbol) e.getKey();
+			Var v = (e.getValue() instanceof Var) ? (Var) e.getValue() : null;
+			if(v != null && v.ns == ns && v.isPublic() && merge.valAt(s) != v)
+				merge = merge.assoc(s,v);
+			}
+		lastCore = ms;
+		lastMerge = merge;
+		}
+	if(tm == dimp)
+		{
+//		System.out.println("initWith REUSE: " + name + ", " + ns.name);
+		return mappings.compareAndSet(tm,lastMerge);
+		}
+	else
+		{
+//		System.out.println("initWith ADD: " + name + ", " + ns.name);
+		IPersistentMap m = lastMerge;
+		for(Object o : tm)
+			{
+			Map.Entry e = (Map.Entry) o;
+			if(m.valAt(e.getKey()) != e.getValue())
+				m = m.assoc(e.getKey(),e.getValue());
+			}
+		return mappings.compareAndSet(tm,m);
+		}
+	}
 }
 
 public static Namespace findOrCreate(Symbol name){
